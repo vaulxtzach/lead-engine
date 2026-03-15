@@ -4,12 +4,30 @@ import csv
 import os
 import re
 from email_validator import validate_email, EmailNotValidError
-from normalizer import normalize_any_row, detect_schema, normalize_row_with_schema
+from normalizer import normalize_any_row, detect_schema, normalize_row_with_schema, validate_record, is_valid_phone, is_valid_email
+from normalizer import normalize_any_row, detect_schema, normalize_row_with_schema, validate_record, is_valid_phone, is_valid_email
+from db import get_conn
 
 app = Flask(__name__)
 DB_FILE = "lead_engine.db"
 UPLOAD_DIR = "uploads"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
+
+
+
+NAV_BAR = """
+<div style="background:#111;padding:14px 18px;margin-bottom:22px;border-radius:10px;
+display:flex;flex-wrap:wrap;gap:18px;font-family:Arial">
+
+<a href="/" style="color:white;text-decoration:none;font-weight:600">Dashboard</a>
+<a href="/upload" style="color:white;text-decoration:none;font-weight:600">Upload</a>
+<a href="/leads" style="color:white;text-decoration:none;font-weight:600">Leads</a>
+<a href="/rejects" style="color:white;text-decoration:none;font-weight:600">Rejects</a>
+<a href="/export" style="color:white;text-decoration:none;font-weight:600">Export</a>
+
+</div>
+"""
+
 
 HTML = """
 <!doctype html>
@@ -27,6 +45,7 @@ HTML = """
   </style>
 </head>
 <body>
+  {NAV_BAR}
   <h1>Lead Engine</h1>
 
   <div class="card">
@@ -64,13 +83,9 @@ HTML = """
 </html>
 """
 
-def conn():
-    c = sqlite3.connect(DB_FILE)
-    c.row_factory = sqlite3.Row
-    return c
 
 def init_db():
-    c = conn()
+    c = get_conn()
     cur = c.cursor()
 
     cur.execute("""
@@ -117,6 +132,20 @@ def init_db():
     )
     """)
 
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS rejected_data (
+        reject_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        email TEXT,
+        first_name TEXT,
+        last_name TEXT,
+        phone TEXT,
+        company TEXT,
+        reject_reason TEXT,
+        raw_payload TEXT,
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP
+    )
+    """)
+
     c.commit()
     c.close()
 
@@ -141,7 +170,7 @@ def clean_email(email):
 
 
 def import_csv(path):
-    c = conn()
+    c = get_conn()
     cur = c.cursor()
     count = 0
 
@@ -204,8 +233,11 @@ def import_csv(path):
     c.close()
     return count
 
+
 def process_raw():
-    c = conn()
+    import json
+
+    c = get_conn()
     cur = c.cursor()
 
     rows = cur.execute("""
@@ -215,6 +247,7 @@ def process_raw():
 
     inserted = 0
     updated = 0
+    rejected = 0
 
     for r in rows:
         email = clean_email(r["email"])
@@ -225,15 +258,66 @@ def process_raw():
         source = r["source"] or "import"
         campaign = r["campaign"] or "default_import"
 
-        dedupe_key = email or phone or None
-        if not dedupe_key:
+        record = {
+            "email": email or "",
+            "first_name": first_name,
+            "last_name": last_name,
+            "phone": phone,
+            "company": company,
+            "source": source,
+            "campaign": campaign,
+        }
+
+        ok, reason = validate_record(record)
+        if not ok:
+            cur.execute("""
+                INSERT INTO rejected_data
+                (email, first_name, last_name, phone, company, reject_reason, raw_payload)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (
+                email or "",
+                first_name,
+                last_name,
+                phone,
+                company,
+                reason,
+                json.dumps(record),
+            ))
+            rejected += 1
             continue
 
-        validation_status = "valid" if email else "phone_only"
+        dedupe_key = email or phone or None
+        if not dedupe_key:
+            cur.execute("""
+                INSERT INTO rejected_data
+                (email, first_name, last_name, phone, company, reject_reason, raw_payload)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (
+                email or "",
+                first_name,
+                last_name,
+                phone,
+                company,
+                "missing_dedupe_key",
+                json.dumps(record),
+            ))
+            rejected += 1
+            continue
+
+        validation_status = "valid_email" if email else "valid_phone"
 
         existing = None
         if email:
-            existing = cur.execute("SELECT contact_id FROM clean_data WHERE email = ?", (email,)).fetchone()
+            existing = cur.execute(
+                "SELECT contact_id FROM clean_data WHERE email = ?",
+                (email,)
+            ).fetchone()
+
+        if not existing and phone:
+            existing = cur.execute(
+                "SELECT contact_id FROM clean_data WHERE phone = ?",
+                (phone,)
+            ).fetchone()
 
         if existing:
             cur.execute("""
@@ -248,7 +332,11 @@ def process_raw():
                     dedupe_key = ?,
                     updated_at = CURRENT_TIMESTAMP
                 WHERE contact_id = ?
-            """, (first_name, last_name, phone, company, source, campaign, validation_status, dedupe_key, existing["contact_id"]))
+            """, (
+                first_name, last_name, phone, company,
+                source, campaign, validation_status,
+                dedupe_key, existing["contact_id"]
+            ))
             updated += 1
         else:
             try:
@@ -256,17 +344,33 @@ def process_raw():
                     INSERT INTO clean_data
                     (email, first_name, last_name, phone, company, source, campaign, validation_status, dedupe_key)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, (email, first_name, last_name, phone, company, source, campaign, validation_status, dedupe_key))
+                """, (
+                    email, first_name, last_name, phone, company,
+                    source, campaign, validation_status, dedupe_key
+                ))
                 inserted += 1
             except sqlite3.IntegrityError:
-                pass
+                rejected += 1
+                cur.execute("""
+                    INSERT INTO rejected_data
+                    (email, first_name, last_name, phone, company, reject_reason, raw_payload)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    email or "",
+                    first_name,
+                    last_name,
+                    phone,
+                    company,
+                    "integrity_error",
+                    json.dumps(record),
+                ))
 
     c.commit()
     c.close()
-    return {"inserted": inserted, "updated": updated}
+    return {"inserted": inserted, "updated": updated, "rejected": rejected}
 
 def score_leads():
-    c = conn()
+    c = get_conn()
     cur = c.cursor()
 
     contacts = cur.execute("""
@@ -309,7 +413,7 @@ def score_leads():
 
 @app.route("/")
 def index():
-    c = conn()
+    c = get_conn()
     cur = c.cursor()
 
     raw_count = cur.execute("SELECT COUNT(*) FROM raw_data").fetchone()[0]
@@ -325,10 +429,40 @@ def index():
     """).fetchall()
 
     c.close()
-    return render_template_string(HTML, raw_count=raw_count, clean_count=clean_count, score_count=score_count, leads=leads)
+    return render_template_string(HTML.replace('{NAV_BAR}', NAV_BAR), raw_count=raw_count, clean_count=clean_count, score_count=score_count, leads=leads)
 
-@app.route("/upload", methods=["POST"])
+@app.route("/upload", methods=["GET", "POST"])
 def upload():
+    if request.method == "GET":
+        html = """
+        <!doctype html>
+        <html>
+        <head>
+          <meta name="viewport" content="width=device-width, initial-scale=1">
+          <title>Upload</title>
+          <style>
+            body{font-family:Arial;background:#0d1117;color:#fff;padding:20px;max-width:900px;margin:auto}
+            .card{background:#161b22;padding:16px;border-radius:12px;margin-bottom:16px}
+            input,button{padding:10px;border-radius:8px;border:none;margin:4px 0}
+          </style>
+        </head>
+        <body>
+          {NAV_BAR}
+          <div class="card">
+            <h1>Upload File</h1>
+            <form action="/upload" method="post" enctype="multipart/form-data">
+              <input type="file" name="file" required>
+              <button type="submit">Upload + Process</button>
+            </form>
+            <p>Test files created in project folder:</p>
+            <p>bad_test_leads.json</p>
+            <p>bad_test_leads.csv</p>
+          </div>
+        </body>
+        </html>
+        """
+        return render_template_string(html.replace("{NAV_BAR}", NAV_BAR))
+
     if "file" not in request.files:
         return "No file uploaded", 400
 
@@ -364,7 +498,7 @@ def leads_view():
     except ValueError:
         limit = 100
 
-    c = conn()
+    c = get_conn()
     cur = c.cursor()
 
     sql = """
@@ -406,6 +540,7 @@ def leads_view():
       </style>
     </head>
     <body>
+      {NAV_BAR}
       <h1>Clean Data Viewer</h1>
 
       <div class="card">
@@ -441,7 +576,7 @@ def leads_view():
     </body>
     </html>
     """
-    return render_template_string(html, rows=rows, q=q, state=state, limit=limit)
+    return render_template_string(html.replace('{NAV_BAR}', NAV_BAR), rows=rows, q=q, state=state, limit=limit)
 
 
 @app.route("/export")
@@ -453,7 +588,7 @@ def export_csv():
     q = (request.args.get("q") or "").strip()
     state = (request.args.get("state") or "").strip().upper()
 
-    c = conn()
+    c = get_conn()
     cur = c.cursor()
 
     sql = """
@@ -493,9 +628,96 @@ def export_csv():
         headers={"Content-Disposition": f"attachment; filename={filename}"}
     )
 
+
+
+@app.route("/rejects")
+def rejects_view():
+    limit_raw = (request.args.get("limit") or "100").strip()
+    reason = (request.args.get("reason") or "").strip()
+
+    try:
+        limit = max(1, min(int(limit_raw), 1000))
+    except ValueError:
+        limit = 100
+
+    c = get_conn()
+    cur = c.cursor()
+
+    sql = """
+        SELECT reject_id, email, first_name, last_name, phone, company, reject_reason, created_at
+        FROM rejected_data
+        WHERE 1=1
+    """
+    params = []
+
+    if reason:
+        sql += " AND reject_reason = ?"
+        params.append(reason)
+
+    sql += " ORDER BY reject_id DESC LIMIT ?"
+    params.append(limit)
+
+    rows = cur.execute(sql, params).fetchall()
+    c.close()
+
+    html = """
+    <!doctype html>
+    <html>
+    <head>
+      <meta name="viewport" content="width=device-width, initial-scale=1">
+      <title>Rejected Data</title>
+      <style>
+        body{font-family:Arial;background:#0d1117;color:#fff;padding:20px;max-width:1200px;margin:auto}
+        .card{background:#161b22;padding:16px;border-radius:12px;margin-bottom:16px}
+        input,button{padding:10px;border-radius:8px;border:none;margin:4px}
+        table{width:100%;border-collapse:collapse;font-size:14px}
+        td,th{padding:8px;border-bottom:1px solid #333;text-align:left}
+        a{color:#58a6ff;text-decoration:none}
+      </style>
+    </head>
+    <body>
+      {NAV_BAR}
+      <h1>Rejected Data</h1>
+      <div class="card">
+        <a href="/">Dashboard</a> |
+        <a href="/leads">Viewer</a> |
+        <a href="/rejects">Rejects</a>
+      </div>
+      <div class="card">
+        <form method="get" action="/rejects">
+          <input name="reason" placeholder="reject reason" value="{{ reason }}">
+          <input name="limit" placeholder="limit" value="{{ limit }}">
+          <button type="submit">Filter</button>
+        </form>
+      </div>
+      <div class="card">
+        <p>Rows shown: {{ rows|length }}</p>
+        <table>
+          <tr>
+            <th>ID</th><th>Email</th><th>First</th><th>Last</th><th>Phone</th><th>State/Company</th><th>Reason</th><th>Created</th>
+          </tr>
+          {% for r in rows %}
+          <tr>
+            <td>{{ r[0] }}</td>
+            <td>{{ r[1] or '' }}</td>
+            <td>{{ r[2] or '' }}</td>
+            <td>{{ r[3] or '' }}</td>
+            <td>{{ r[4] or '' }}</td>
+            <td>{{ r[5] or '' }}</td>
+            <td>{{ r[6] or '' }}</td>
+            <td>{{ r[7] or '' }}</td>
+          </tr>
+          {% endfor %}
+        </table>
+      </div>
+    </body>
+    </html>
+    """
+    return render_template_string(html.replace('{NAV_BAR}', NAV_BAR), rows=rows, reason=reason, limit=limit)
+
 @app.route("/api/leads")
 def api_leads():
-    c = conn()
+    c = get_conn()
     rows = c.execute("""
         SELECT c.contact_id, c.email, c.first_name, c.last_name, c.phone, c.company, ls.score, ls.grade, ls.reason
         FROM clean_data c
