@@ -276,3 +276,105 @@ if __name__ == "__main__":
         "Case #": "ABC123"
     }
     print(normalize_any_row(sample))
+
+
+def detect_value_type(value):
+    v = normalize_text(value)
+    if not v:
+        return "empty"
+    if looks_like_email(v):
+        return "email"
+    if looks_like_phone(v):
+        return "phone"
+    if normalize_state(v) in US_STATE_ABBR:
+        return "state"
+    if looks_like_date(v):
+        return "date"
+    if looks_like_currency(v):
+        return "amount_owed"
+    if looks_like_name(v):
+        return "full_name"
+    return "text"
+
+def detect_schema(rows):
+    """
+    Analyze a sample of rows and return:
+    {
+      "column_map": {"Raw Header": "canonical_field"},
+      "detected_types": {"Raw Header": "email" | "phone" | ...}
+    }
+    """
+    if not rows:
+        return {"column_map": {}, "detected_types": {}}
+
+    scores = {}
+    detected_types = {}
+
+    for row in rows:
+        for raw_key, raw_value in row.items():
+            raw_key = str(raw_key)
+            scores.setdefault(raw_key, {})
+            header_match = match_header_to_canonical(raw_key)
+            value_match = infer_canonical_from_value(raw_value)
+            value_type = detect_value_type(raw_value)
+
+            if header_match:
+                scores[raw_key][header_match] = scores[raw_key].get(header_match, 0) + 5
+
+            if value_match:
+                scores[raw_key][value_match] = scores[raw_key].get(value_match, 0) + 1
+
+            if raw_key not in detected_types:
+                detected_types[raw_key] = {}
+            detected_types[raw_key][value_type] = detected_types[raw_key].get(value_type, 0) + 1
+
+    column_map = {}
+    for raw_key, field_scores in scores.items():
+        if field_scores:
+            best = sorted(field_scores.items(), key=lambda x: x[1], reverse=True)[0][0]
+            column_map[raw_key] = best
+
+    final_types = {}
+    for raw_key, type_scores in detected_types.items():
+        best = sorted(type_scores.items(), key=lambda x: x[1], reverse=True)[0][0]
+        final_types[raw_key] = best
+
+    return {
+        "column_map": column_map,
+        "detected_types": final_types,
+    }
+
+def normalize_row_with_schema(row, schema_map):
+    raw = dict(row)
+    normalized = {field: "" for field in CANONICAL_FIELDS}
+    mapping = {}
+    detected = {}
+
+    for raw_key, raw_value in row.items():
+        canonical = schema_map.get(raw_key) or match_header_to_canonical(raw_key)
+
+        if canonical:
+            mapping[raw_key] = canonical
+            normalized[canonical] = normalize_field_value(canonical, raw_value)
+            detected[canonical] = detect_value_type(str(raw_value))
+        else:
+            inferred = infer_canonical_from_value(raw_value)
+            if inferred and not normalized.get(inferred):
+                mapping[raw_key] = inferred
+                normalized[inferred] = normalize_field_value(inferred, raw_value)
+                detected[inferred] = detect_value_type(str(raw_value))
+
+    normalized = post_normalize_record(normalized)
+
+    extras = {}
+    for raw_key, raw_value in row.items():
+        if raw_key not in mapping:
+            extras[raw_key] = raw_value
+
+    return {
+        "normalized": normalized,
+        "raw": raw,
+        "mapping": mapping,
+        "detected_types": detected,
+        "extra_fields": extras,
+    }

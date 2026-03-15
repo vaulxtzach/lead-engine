@@ -4,7 +4,7 @@ import csv
 import os
 import re
 from email_validator import validate_email, EmailNotValidError
-from normalizer import normalize_any_row
+from normalizer import normalize_any_row, detect_schema, normalize_row_with_schema
 
 app = Flask(__name__)
 DB_FILE = "lead_engine.db"
@@ -139,6 +139,7 @@ def clean_email(email):
 
 
 
+
 def import_csv(path):
     c = conn()
     cur = c.cursor()
@@ -176,9 +177,16 @@ def import_csv(path):
 
         else:
             reader = csv.DictReader(f)
+            all_rows = list(reader)
 
-            for row in reader:
-                record = normalize_any_row(row)["normalized"]
+            sample_rows = all_rows[:100]
+            schema_info = detect_schema(sample_rows)
+            schema_map = schema_info["column_map"]
+
+            print("DETECTED SCHEMA:", schema_map)
+
+            for row in all_rows:
+                record = normalize_row_with_schema(row, schema_map)["normalized"]
 
                 email = record["email"]
                 phone = record["phone"]
@@ -342,6 +350,148 @@ def upload():
         "processed": processed,
         "scored": True
     })
+
+
+
+@app.route("/leads")
+def leads_view():
+    q = (request.args.get("q") or "").strip()
+    state = (request.args.get("state") or "").strip().upper()
+    limit = request.args.get("limit", "100")
+
+    try:
+        limit = max(1, min(int(limit), 1000))
+    except ValueError:
+        limit = 100
+
+    c = conn()
+    cur = c.cursor()
+
+    sql = """
+        SELECT c.contact_id, c.email, c.first_name, c.last_name, c.phone, c.company, ls.score, ls.grade
+        FROM clean_data c
+        LEFT JOIN lead_scores ls ON c.contact_id = ls.contact_id
+        WHERE 1=1
+    """
+    params = []
+
+    if state:
+        sql += " AND c.company = ?"
+        params.append(state)
+
+    if q:
+        sql += " AND (c.phone LIKE ? OR c.email LIKE ? OR c.first_name LIKE ? OR c.last_name LIKE ?)"
+        like = f"%{q}%"
+        params.extend([like, like, like, like])
+
+    sql += " ORDER BY c.contact_id DESC LIMIT ?"
+    params.append(limit)
+
+    rows = cur.execute(sql, params).fetchall()
+    c.close()
+
+    html = """
+    <!doctype html>
+    <html>
+    <head>
+      <meta name="viewport" content="width=device-width, initial-scale=1">
+      <title>Clean Data Viewer</title>
+      <style>
+        body{font-family:Arial;background:#0d1117;color:#fff;padding:20px;max-width:1200px;margin:auto}
+        .card{background:#161b22;padding:16px;border-radius:12px;margin-bottom:16px}
+        input,button{padding:10px;border-radius:8px;border:none;margin:4px}
+        table{width:100%;border-collapse:collapse;font-size:14px}
+        td,th{padding:8px;border-bottom:1px solid #333;text-align:left}
+        a{color:#58a6ff}
+      </style>
+    </head>
+    <body>
+      <h1>Clean Data Viewer</h1>
+
+      <div class="card">
+        <form method="get" action="/leads">
+          <input name="q" placeholder="Search phone, email, first, last" value="{{ q }}">
+          <input name="state" placeholder="State e.g. CA" value="{{ state }}">
+          <input name="limit" placeholder="Limit" value="{{ limit }}">
+          <button type="submit">Search</button>
+          <a href="/export?state={{ state }}&q={{ q }}">Export CSV</a>
+        </form>
+      </div>
+
+      <div class="card">
+        <p>Rows shown: {{ rows|length }}</p>
+        <table>
+          <tr>
+            <th>ID</th><th>Email</th><th>First</th><th>Last</th><th>Phone</th><th>State/Company</th><th>Score</th><th>Grade</th>
+          </tr>
+          {% for r in rows %}
+          <tr>
+            <td>{{ r[0] }}</td>
+            <td>{{ r[1] or '' }}</td>
+            <td>{{ r[2] or '' }}</td>
+            <td>{{ r[3] or '' }}</td>
+            <td>{{ r[4] or '' }}</td>
+            <td>{{ r[5] or '' }}</td>
+            <td>{{ r[6] or '' }}</td>
+            <td>{{ r[7] or '' }}</td>
+          </tr>
+          {% endfor %}
+        </table>
+      </div>
+    </body>
+    </html>
+    """
+    return render_template_string(html, rows=rows, q=q, state=state, limit=limit)
+
+
+@app.route("/export")
+def export_csv():
+    import io
+    import csv as pycsv
+    from flask import Response
+
+    q = (request.args.get("q") or "").strip()
+    state = (request.args.get("state") or "").strip().upper()
+
+    c = conn()
+    cur = c.cursor()
+
+    sql = """
+        SELECT c.contact_id, c.email, c.first_name, c.last_name, c.phone, c.company, ls.score, ls.grade
+        FROM clean_data c
+        LEFT JOIN lead_scores ls ON c.contact_id = ls.contact_id
+        WHERE 1=1
+    """
+    params = []
+
+    if state:
+        sql += " AND c.company = ?"
+        params.append(state)
+
+    if q:
+        sql += " AND (c.phone LIKE ? OR c.email LIKE ? OR c.first_name LIKE ? OR c.last_name LIKE ?)"
+        like = f"%{q}%"
+        params.extend([like, like, like, like])
+
+    sql += " ORDER BY c.contact_id DESC LIMIT 50000"
+
+    rows = cur.execute(sql, params).fetchall()
+    c.close()
+
+    output = io.StringIO()
+    writer = pycsv.writer(output)
+    writer.writerow(["contact_id","email","first_name","last_name","phone","state_or_company","score","grade"])
+    writer.writerows(rows)
+
+    filename = "clean_export.csv"
+    if state:
+        filename = f"{state.lower()}_export.csv"
+
+    return Response(
+        output.getvalue(),
+        mimetype="text/csv",
+        headers={"Content-Disposition": f"attachment; filename={filename}"}
+    )
 
 @app.route("/api/leads")
 def api_leads():
