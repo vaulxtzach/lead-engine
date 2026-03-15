@@ -59,8 +59,23 @@ HTML = """
   <div class="card">
     <h2>Stats</h2>
     <p>Raw Records: {{ raw_count }}</p>
+    <p>Unprocessed Raw: {{ unprocessed_count or 0 }}</p>
     <p>Clean Contacts: {{ clean_count }}</p>
+    <p>Rejected Rows: {{ rejected_count or 0 }}</p>
     <p>Scored Leads: {{ score_count }}</p>
+  </div>
+
+  <div class="card">
+    <h2>Top Reject Reasons</h2>
+    <table>
+      <tr><th>Reason</th><th>Count</th></tr>
+      {% for row in reject_reasons %}
+      <tr>
+        <td>{{ row[0] or '' }}</td>
+        <td>{{ row[1] or 0 }}</td>
+      </tr>
+      {% endfor %}
+    </table>
   </div>
 
   <div class="card">
@@ -98,6 +113,7 @@ def init_db():
         company TEXT,
         source TEXT DEFAULT 'import',
         campaign TEXT DEFAULT 'default_import',
+        processed INTEGER DEFAULT 0,
         import_date TEXT DEFAULT CURRENT_DATE,
         created_at TEXT DEFAULT CURRENT_TIMESTAMP
     )
@@ -146,6 +162,11 @@ def init_db():
     )
     """)
 
+    try:
+        cur.execute("ALTER TABLE raw_data ADD COLUMN processed INTEGER DEFAULT 0")
+    except Exception:
+        pass
+
     c.commit()
     c.close()
 
@@ -165,6 +186,7 @@ def clean_email(email):
         return validate_email(email, check_deliverability=False).normalized
     except EmailNotValidError:
         return None
+
 
 
 
@@ -204,17 +226,25 @@ def import_csv(path):
                 """, ("", "", "", phone, state))
                 count += 1
 
+                if count % 1000 == 0:
+                    c.commit()
+
         else:
             reader = csv.DictReader(f)
-            all_rows = list(reader)
 
-            sample_rows = all_rows[:100]
+            sample_rows = []
+            for _ in range(100):
+                try:
+                    row = next(reader)
+                    sample_rows.append(row)
+                except StopIteration:
+                    break
+
             schema_info = detect_schema(sample_rows)
             schema_map = schema_info["column_map"]
-
             print("DETECTED SCHEMA:", schema_map)
 
-            for row in all_rows:
+            for row in sample_rows:
                 record = normalize_row_with_schema(row, schema_map)["normalized"]
 
                 email = record["email"]
@@ -229,10 +259,29 @@ def import_csv(path):
                 """, (email, first_name, last_name, phone, company))
                 count += 1
 
+            c.commit()
+
+            for row in reader:
+                record = normalize_row_with_schema(row, schema_map)["normalized"]
+
+                email = record["email"]
+                phone = record["phone"]
+                first_name = record["first_name"]
+                last_name = record["last_name"]
+                company = record["company"] or record["state"]
+
+                cur.execute("""
+                    INSERT INTO raw_data (email, first_name, last_name, phone, company)
+                    VALUES (?, ?, ?, ?, ?)
+                """, (email, first_name, last_name, phone, company))
+                count += 1
+
+                if count % 1000 == 0:
+                    c.commit()
+
     c.commit()
     c.close()
     return count
-
 
 def process_raw():
     import json
@@ -242,14 +291,18 @@ def process_raw():
 
     rows = cur.execute("""
         SELECT record_id, email, first_name, last_name, phone, company, source, campaign
-        FROM raw_data ORDER BY record_id ASC
+        FROM raw_data
+        WHERE processed = 0
+        ORDER BY record_id ASC
     """).fetchall()
 
     inserted = 0
     updated = 0
     rejected = 0
+    processed_ids = []
 
     for r in rows:
+        record_id = r["record_id"]
         email = clean_email(r["email"])
         first_name = (r["first_name"] or "").strip()
         last_name = (r["last_name"] or "").strip()
@@ -284,6 +337,7 @@ def process_raw():
                 json.dumps(record),
             ))
             rejected += 1
+            processed_ids.append(record_id)
             continue
 
         dedupe_key = email or phone or None
@@ -302,6 +356,7 @@ def process_raw():
                 json.dumps(record),
             ))
             rejected += 1
+            processed_ids.append(record_id)
             continue
 
         validation_status = "valid_email" if email else "valid_phone"
@@ -341,14 +396,17 @@ def process_raw():
         else:
             try:
                 cur.execute("""
-                    INSERT INTO clean_data
+                    INSERT OR IGNORE INTO clean_data
                     (email, first_name, last_name, phone, company, source, campaign, validation_status, dedupe_key)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (
                     email, first_name, last_name, phone, company,
                     source, campaign, validation_status, dedupe_key
                 ))
-                inserted += 1
+                if cur.rowcount > 0:
+                    inserted += 1
+                else:
+                    updated += 1
             except sqlite3.IntegrityError:
                 rejected += 1
                 cur.execute("""
@@ -365,9 +423,18 @@ def process_raw():
                     json.dumps(record),
                 ))
 
+        processed_ids.append(record_id)
+
+    if processed_ids:
+        placeholders = ",".join(["?"] * len(processed_ids))
+        cur.execute(
+            f"UPDATE raw_data SET processed = 1 WHERE record_id IN ({placeholders})",
+            processed_ids
+        )
+
     c.commit()
     c.close()
-    return {"inserted": inserted, "updated": updated, "rejected": rejected}
+    return {"inserted": inserted, "updated": updated, "rejected": rejected, "processed_rows": len(processed_ids)}
 
 def score_leads():
     c = get_conn()
