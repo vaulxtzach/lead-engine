@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify, render_template_string
+from flask import Flask, request, jsonify, render_template_string, send_file
 import sqlite3
 import csv
 import os
@@ -644,6 +644,87 @@ def leads_view():
     </html>
     """
     return render_template_string(html.replace('{NAV_BAR}', NAV_BAR), rows=rows, q=q, state=state, limit=limit)
+
+
+
+@app.route("/export_cloudtalk")
+def export_cloudtalk():
+    import csv
+    import os
+
+    campaign = (request.args.get("campaign") or "debt").strip().lower()
+    state_filter = (request.args.get("state") or "").strip().upper()
+    assigned_to = (request.args.get("assigned") or "Team A").strip()
+    try:
+        limit = int(request.args.get("limit", 100))
+    except:
+        limit = 100
+
+    limit = max(1, min(limit, 5000))
+
+    conn = get_conn()
+    cur = conn.cursor()
+
+    # current schema fallback:
+    # company is often being used as a rough state/company field in clean_data
+    rows = cur.execute("""
+        SELECT first_name, last_name, phone, company, email, source, campaign
+        FROM clean_data
+        WHERE phone != ''
+        ORDER BY contact_id DESC
+    """).fetchall()
+
+    campaign_label = "Debt Settlement" if campaign == "debt" else "Tax Relief"
+
+    filtered = []
+    seen = set()
+
+    for row in rows:
+        first = row[0] or ""
+        last = row[1] or ""
+        phone = row[2] or ""
+        state = (row[3] or "").strip().upper()
+        email = row[4] or ""
+        source = (row[5] or "").strip().lower()
+        camp = (row[6] or "").strip().lower()
+
+        if not phone:
+            continue
+
+        # dedupe by phone
+        if phone in seen:
+            continue
+        seen.add(phone)
+
+        # state filter if provided
+        if state_filter and state != state_filter:
+            continue
+
+        # campaign filter using current source/campaign hints
+        text = f"{source} {camp}"
+        if campaign == "debt":
+            if not any(x in text for x in ["debt", "settlement", "credit", "relief"]):
+                # keep as fallback if no campaign text exists
+                pass
+        elif campaign == "tax":
+            if not any(x in text for x in ["tax", "irs", "resolution"]):
+                pass
+
+        name = f"{first} {last}".strip()
+        filtered.append([name, phone, state, campaign_label, email, assigned_to])
+
+        if len(filtered) >= limit:
+            break
+
+    out_path = f"cloudtalk_{campaign}_{state_filter or 'all'}_{limit}.csv"
+
+    with open(out_path, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["Name","Phone Number","State","Debt or Tax","Email","Assigned To"])
+        w.writerows(filtered)
+
+    conn.close()
+    return send_file(out_path, as_attachment=True)
 
 
 @app.route("/export")

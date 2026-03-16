@@ -18,12 +18,13 @@ def get_conn():
             raise RuntimeError("Postgres mode selected but POSTGRES_URL is empty")
         return psycopg2.connect(POSTGRES_URL)
 
-    conn = sqlite3.connect(SQLITE_PATH, timeout=30)
+    conn = sqlite3.connect(SQLITE_PATH, timeout=60)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA synchronous=NORMAL;")
     return conn
 
 if __name__ == "__main__":
     conn = get_conn()
-    print("DB_MODE =", DB_MODE)
     print("connected ok")
     conn.close()

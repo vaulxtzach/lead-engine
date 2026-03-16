@@ -1,6 +1,27 @@
+# python
 __pycache__/
 *.pyc
+*.pyo
+
+# env / local
 .env
-lead_engine.db
-uploads/
+.venv/
+venv/
+
+# data / pii
+*.db
+*.sqlite
+*.sqlite3
+*.csv
+*.xlsx
+*.xls
 exports/
+batches/
+uploads/
+instance/
+data/
+*.log
+
+# os/editor
+.DS_Store
+Thumbs.db

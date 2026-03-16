@@ -378,3 +378,51 @@ def normalize_row_with_schema(row, schema_map):
         "detected_types": detected,
         "extra_fields": extras,
     }
+
+
+FAKE_PHONES = {
+    "0000000000", "1111111111", "2222222222", "3333333333",
+    "4444444444", "5555555555", "6666666666", "7777777777",
+    "8888888888", "9999999999", "1234567890", "0123456789"
+}
+
+def is_valid_phone(phone):
+    p = normalize_phone(phone)
+    if not p:
+        return False
+    if len(p) != 10:
+        return False
+    if p in FAKE_PHONES:
+        return False
+    if p[0] in ("0", "1"):
+        return False
+    return True
+
+def is_valid_email(email):
+    e = normalize_email(email)
+    if not e:
+        return False
+    if "@" not in e:
+        return False
+    parts = e.split("@")
+    if len(parts) != 2:
+        return False
+    local, domain = parts
+    if not local or not domain or "." not in domain:
+        return False
+    return True
+
+def validate_record(record):
+    phone = normalize_phone(record.get("phone", ""))
+    email = normalize_email(record.get("email", ""))
+
+    if not phone and not email:
+        return False, "missing_contact"
+
+    if phone and not is_valid_phone(phone):
+        return False, "invalid_phone"
+
+    if email and not is_valid_email(email):
+        return False, "invalid_email"
+
+    return True, ""
