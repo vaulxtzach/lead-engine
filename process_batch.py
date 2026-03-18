@@ -61,6 +61,18 @@ def score_row(phone, email, state, first_name, last_name):
     grade = "A" if score >= 80 else "B" if score >= 60 else "C" if score >= 45 else "D"
     return score, grade, ",".join(reasons)
 
+def compute_tier(phone, email, state, first_name, last_name):
+    has_name = bool(first_name or last_name)
+    has_email = bool(email)
+    has_state = bool(state)
+    if phone and has_state and (has_name or has_email):
+        return "A"
+    if phone and has_state:
+        return "B"
+    if phone:
+        return "C"
+    return "D"
+
 def ensure_meta(cur):
     cur.execute("""
         CREATE TABLE IF NOT EXISTS engine_meta (
@@ -74,9 +86,18 @@ def ensure_meta(cur):
     cur.execute("CREATE INDEX IF NOT EXISTS idx_clean_email ON clean_data(email)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_clean_phone ON clean_data(phone)")
 
+def ensure_tier_column(cur):
+    try:
+        cur.execute("ALTER TABLE leads ADD COLUMN tier TEXT")
+    except sqlite3.OperationalError:
+        pass
+
 def get_last_id(cur):
     row = cur.execute("SELECT value FROM engine_meta WHERE key='last_processed_record_id'").fetchone()
-    return int(row[0]) if row and row[0] else 0
+    if row and row[0]:
+        return int(row[0])
+    fallback = cur.execute("SELECT COALESCE(MAX(contact_id), 0) FROM clean_data").fetchone()[0]
+    return int(fallback or 0)
 
 def set_last_id(cur, last_id):
     cur.execute("""
@@ -84,12 +105,24 @@ def set_last_id(cur, last_id):
         ON CONFLICT(key) DO UPDATE SET value=excluded.value
     """, (str(last_id),))
 
+def fetch_existing_set(cur, table, column, values):
+    vals = [v for v in values if v]
+    if not vals:
+        return set()
+    placeholders = ",".join(["?"] * len(vals))
+    rows = cur.execute(
+        f"SELECT {column} FROM {table} WHERE {column} IN ({placeholders})",
+        vals
+    ).fetchall()
+    return {r[0] for r in rows if r[0]}
+
 def process_once():
     conn = sqlite3.connect(DB)
     conn.row_factory = sqlite3.Row
     cur = conn.cursor()
 
     ensure_meta(cur)
+    ensure_tier_column(cur)
     conn.commit()
 
     last_id = get_last_id(cur)
@@ -107,13 +140,7 @@ def process_once():
         conn.close()
         return False
 
-    clean_inserted = 0
-    rejected_inserted = 0
-    lead_inserted = 0
-    score_inserted = 0
-    skipped_clean_dupes = 0
-    skipped_lead_dupes = 0
-
+    normalized = []
     max_seen_id = last_id
 
     for r in rows:
@@ -132,10 +159,42 @@ def process_once():
         email = normalize_email(raw_email)
         state = normalize_state("", company)
 
-        has_identity = bool(first_name or last_name or company or email)
+        normalized.append({
+            "record_id": record_id,
+            "first_name": first_name or None,
+            "last_name": last_name or None,
+            "raw_phone": raw_phone or None,
+            "raw_email": raw_email or None,
+            "company": company or None,
+            "source": source or None,
+            "campaign": campaign or None,
+            "phone": phone,
+            "email": email,
+            "state": state,
+        })
+
+    batch_phones = {r["phone"] for r in normalized if r["phone"]}
+    batch_emails = {r["email"] for r in normalized if r["email"]}
+
+    existing_clean_phones = fetch_existing_set(cur, "clean_data", "phone", batch_phones)
+    existing_clean_emails = fetch_existing_set(cur, "clean_data", "email", batch_emails)
+    existing_lead_phones = fetch_existing_set(cur, "leads", "phone", batch_phones)
+
+    seen_batch_phones = set()
+    seen_batch_emails = set()
+
+    clean_inserted = 0
+    rejected_inserted = 0
+    lead_inserted = 0
+    score_inserted = 0
+    skipped_clean_dupes = 0
+    skipped_lead_dupes = 0
+
+    for r in normalized:
+        has_identity = bool(r["first_name"] or r["last_name"] or r["company"] or r["email"])
 
         reject_reasons = []
-        if not phone:
+        if not r["phone"]:
             reject_reasons.append("invalid_phone")
         if not has_identity:
             reject_reasons.append("missing_identity")
@@ -146,41 +205,35 @@ def process_once():
                     email, first_name, last_name, phone, company, reject_reason, raw_payload, created_at
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """, (
-                raw_email if raw_email else None,
-                first_name or None,
-                last_name or None,
-                raw_phone if raw_phone else None,
-                company if company else None,
+                r["raw_email"],
+                r["first_name"],
+                r["last_name"],
+                r["raw_phone"],
+                r["company"],
                 ",".join(reject_reasons),
-                str(dict(r)),
+                str(r),
                 now()
             ))
             rejected_inserted += 1
             continue
 
-        existing_clean = None
-        if email:
-            existing_clean = cur.execute(
-                "SELECT 1 FROM clean_data WHERE email = ? LIMIT 1", (email,)
-            ).fetchone()
-        if not existing_clean and phone:
-            existing_clean = cur.execute(
-                "SELECT 1 FROM clean_data WHERE phone = ? LIMIT 1", (phone,)
-            ).fetchone()
-
-        if existing_clean:
+        if r["email"] and (r["email"] in existing_clean_emails or r["email"] in seen_batch_emails):
             skipped_clean_dupes += 1
             continue
-
-        existing_lead = cur.execute(
-            "SELECT 1 FROM leads WHERE phone = ? LIMIT 1", (phone,)
-        ).fetchone()
-        if existing_lead:
+        if r["phone"] and (r["phone"] in existing_clean_phones or r["phone"] in seen_batch_phones):
+            skipped_clean_dupes += 1
+            continue
+        if r["phone"] and r["phone"] in existing_lead_phones:
             skipped_lead_dupes += 1
             continue
 
-        score, grade, reason = score_row(phone, email, state, first_name, last_name)
-        dedupe_key = email if email else phone
+        score, grade, reason = score_row(
+            r["phone"], r["email"], r["state"], r["first_name"], r["last_name"]
+        )
+        tier = compute_tier(
+            r["phone"], r["email"], r["state"], r["first_name"], r["last_name"]
+        )
+        dedupe_key = r["email"] if r["email"] else r["phone"]
 
         cur.execute("""
             INSERT INTO clean_data (
@@ -189,31 +242,36 @@ def process_once():
                 intent_reason, inferred_state, timezone, dial_window, carrier, line_type
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
-            record_id, email, first_name or None, last_name or None, phone, company or None,
-            source or None, campaign or None, "format_valid", dedupe_key,
-            now(), now(), score, grade, reason, state, None, None, None, None
+            r["record_id"], r["email"], r["first_name"], r["last_name"], r["phone"], r["company"],
+            r["source"], r["campaign"], "format_valid", dedupe_key,
+            now(), now(), score, grade, reason, r["state"], None, None, None, None
         ))
         clean_inserted += 1
 
         cur.execute("""
             INSERT INTO lead_scores (contact_id, score, grade, reason, updated_at)
             VALUES (?, ?, ?, ?, ?)
-        """, (record_id, score, grade, reason, now()))
+        """, (r["record_id"], score, grade, reason, now()))
         score_inserted += 1
 
         cur.execute("""
             INSERT INTO leads (
                 first_name, last_name, phone, email, state, age, dob, mortgage_amount,
                 loan_to_value, net_worth, source, campaign, vertical, score, status,
-                reject_reason, assigned_to, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                reject_reason, assigned_to, created_at, tier
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
-            first_name or None, last_name or None, phone, email, state,
+            r["first_name"], r["last_name"], r["phone"], r["email"], r["state"],
             None, None, None, None, None,
-            source or None, campaign or None, "tax", score, "clean",
-            None, None, now()
+            r["source"], r["campaign"], "tax", score, "clean",
+            None, None, now(), tier
         ))
         lead_inserted += 1
+
+        if r["phone"]:
+            seen_batch_phones.add(r["phone"])
+        if r["email"]:
+            seen_batch_emails.add(r["email"])
 
     set_last_id(cur, max_seen_id)
     conn.commit()
