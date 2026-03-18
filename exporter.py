@@ -8,7 +8,7 @@ DB = "lead_engine.db"
 EXPORT_DIR = "exports_out"
 os.makedirs(EXPORT_DIR, exist_ok=True)
 
-def export_leads(vertical="tax", limit=100):
+def export_leads(vertical="tax", limit=100, tier=None):
     if vertical not in VERTICALS:
         raise ValueError(f"Invalid vertical: {vertical}")
 
@@ -18,20 +18,29 @@ def export_leads(vertical="tax", limit=100):
     conn.row_factory = sqlite3.Row
     cur = conn.cursor()
 
-    rows = cur.execute("""
-        SELECT first_name, last_name, phone, state, email, source, campaign, score
+    sql = """
+        SELECT first_name, last_name, phone, state, email, source, campaign, score, tier
         FROM leads
         WHERE phone IS NOT NULL AND TRIM(phone) != ''
-        ORDER BY score DESC, id DESC
-        LIMIT ?
-    """, (limit,)).fetchall()
+    """
+    params = []
+
+    if tier:
+        sql += " AND tier = ?"
+        params.append(tier)
+
+    sql += " ORDER BY score DESC, id DESC LIMIT ?"
+    params.append(limit)
+
+    rows = cur.execute(sql, params).fetchall()
 
     ts = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
-    path = os.path.join(EXPORT_DIR, f"{vertical}_dialer_{ts}.csv")
+    tier_part = f"_{tier}" if tier else ""
+    path = os.path.join(EXPORT_DIR, f"{vertical}{tier_part}_dialer_{ts}.csv")
 
     with open(path, "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
-        w.writerow(["Name","Phone","State","Email","Vertical","Source","Score"])
+        w.writerow(["Name","Phone","State","Email","Vertical","Source","Score","Tier"])
 
         for r in rows:
             name = f"{r['first_name'] or ''} {r['last_name'] or ''}".strip() or "Unknown"
@@ -42,7 +51,8 @@ def export_leads(vertical="tax", limit=100):
                 r["email"] or "",
                 label,
                 r["source"] or "engine",
-                r["score"] or 0
+                r["score"] or 0,
+                r["tier"] or ""
             ])
 
     conn.close()
